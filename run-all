@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Full pipeline: scan → classify → candidates → generate → authorize → backup
+#   → publish → index → track → client report → optimization loop
+#
+#   Step 1–2  Scan + enrich        → report.csv
+#   Step 3    Classify nodes       → results/*.txt
+#   Step 4    Select candidates    → candidates.txt
+#   Step 5    Generate pages      → output/pages/, manifest.csv
+#   Step 5a   Authorization (L1)   → logs/authorization.log
+#   Step 5b   Backup (L2)          → output/backup/<timestamp>/
+#   Step 6    Publish              → published.txt
+#   Step 7    Indexing             → indexing.csv
+#   Step 8    Traffic tracking     → traffic_report.csv
+#   Step 9    Client report (L3)   → client_report.csv / .html
+#   Step 10   Optimization loop    → traffic.csv + candidates refresh
+#
+# Usage:
+#   ./run-all                  # full run
+#   ./run-all --test           # Steps 5–8 on first candidate only
+#   ./run-all --skip-scan      # Steps 3–10 using existing report.csv
+#   ./run-all --from-step 5    # resume from generate
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results logs config output templates output/backup
+
+TEST=0
+SKIP_SCAN=0
+FROM_STEP=1
+SCAN_ARGS=()
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --test)       TEST=1; shift ;;
+    --skip-scan)  SKIP_SCAN=1; shift ;;
+    --from-step)  FROM_STEP="${2:?}"; shift 2 ;;
+    -h|--help)    usage 0 ;;
+    *)            SCAN_ARGS+=("$1"); shift ;;
+  esac
+done
+
+step() {
+  echo ""
+  echo "════════════════════════════════════════════════════════════"
+  echo "  $1"
+  echo "════════════════════════════════════════════════════════════"
+}
+
+first_candidate() {
+  if [[ ! -s results/candidates.txt ]]; then
+    echo "[!] results/candidates.txt is empty — run Steps 1–4 first" >&2
+    exit 1
+  fi
+  head -n1 results/candidates.txt | tr -d '\r'
+}
+
+if [[ "$SKIP_SCAN" -eq 1 && "$FROM_STEP" -le 3 ]]; then
+  if [[ ! -f results/report.csv ]] || [[ "$(wc -l < results/report.csv)" -le 1 ]]; then
+    echo "[!] results/report.csv is empty — run ./scan first (omit --skip-scan)" >&2
+    exit 1
+  fi
+fi
+
+# ── Steps 1–2: Scan + report ────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 2 && "$SKIP_SCAN" -eq 0 ]]; then
+  step "Step 1–2: Scan + enrich → report.csv"
+  python3 scripts/build_report.py "${SCAN_ARGS[@]}"
+fi
+
+# ── Step 3: Classify ────────────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 3 ]]; then
+  step "Step 3: Classify nodes → results/*.txt"
+  python3 scripts/classify_nodes.py
+fi
+
+# ── Step 4: Candidates ──────────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 4 ]]; then
+  step "Step 4: Select candidates → candidates.txt"
+  python3 scripts/check_nodes.py --auto-traffic medium
+fi
+
+# ── Step 5: Generate pages ──────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 5 ]]; then
+  step "Step 5: Generate bridge pages → output/pages/"
+  if [[ "$TEST" -eq 1 ]]; then
+    python3 scripts/generate_pages.py --test
+  else
+    python3 scripts/generate_pages.py
+  fi
+fi
+
+# ── Step 5a: Authorization (Layer 1) ────────────────────────────────────────
+if [[ "$FROM_STEP" -le 6 ]]; then
+  step "Step 5a: Authorization check (Layer 1)"
+  python3 scripts/authorize_check.py --require-manifest
+fi
+
+# ── Step 5b: Backup (Layer 2) ───────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 6 ]]; then
+  step "Step 5b: Backup / rollback plan (Layer 2)"
+  python3 scripts/backup_deploy.py
+fi
+
+# ── Step 6: Publish ─────────────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 6 ]]; then
+  step "Step 6: Publish pages → remote nodes"
+  if [[ "$TEST" -eq 1 ]]; then
+    TARGET="$(first_candidate)"
+    python3 scripts/publish_pages.py --test -u "$TARGET" || true
+  else
+    python3 scripts/publish_pages.py || true
+  fi
+fi
+
+# ── Step 7: Indexing ────────────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 7 ]]; then
+  step "Step 7: Indexing verify + ping"
+  if [[ "$TEST" -eq 1 ]]; then
+    TARGET="$(first_candidate)"
+    python3 scripts/index_pages.py --test -u "$TARGET"
+  else
+    python3 scripts/index_pages.py --published-only
+  fi
+fi
+
+# ── Step 8: Traffic tracking ────────────────────────────────────────────────
+if [[ "$FROM_STEP" -le 8 ]]; then
+  step "Step 8: Traffic tracking → traffic_report.csv"
+  if [[ "$TEST" -eq 1 ]]; then
+    TARGET="$(first_candidate)"
+    python3 scripts/track_traffic.py --test -u "$TARGET"
+  else
+    python3 scripts/track_traffic.py --published-only
+  fi
+fi
+
+# ── Step 9: Client result report (Layer 3) ──────────────────────────────────
+step "Step 9: Client result report (Layer 3)"
+python3 scripts/result_report.py
+
+# ── Step 10: Optimization loop ──────────────────────────────────────────────
+step "Step 10: Optimization loop"
+python3 scripts/optimize_loop.py || true
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  PIPELINE COMPLETE"
+echo "════════════════════════════════════════════════════════════"
+echo "  report:         results/report.csv"
+echo "  candidates:     results/candidates.txt"
+echo "  pages:          output/pages/"
+echo "  manifest:       output/manifest.csv"
+echo "  published:      results/published.txt"
+echo "  indexing:       results/indexing.csv"
+echo "  traffic:        results/traffic_report.csv"
+echo "  client report:  results/client_report.csv"
+echo "  client html:    results/client_report.html"
+echo "  backup:         output/backup/"
+echo "  logs:           logs/"
+if [[ "$TEST" -eq 1 ]]; then
+  echo ""
+  echo "  (ran with --test: Steps 5–8 used first candidate only)"
+fi
+echo ""
+echo "  Funnel: indexed SEO page → user clicks CTA → liumen26 (UTM tracked)"
+echo ""

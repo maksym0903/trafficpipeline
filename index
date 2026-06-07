@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Step 7: verify sitemap/robots/canonical + ping Google/Bing
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results logs output
+exec python3 scripts/index_pages.py "$@"

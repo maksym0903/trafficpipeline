@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the full scan pipeline -> success.txt + failed.txt + stack/*.txt + report.csv + report.xlsx
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results
+exec python3 tools/nextrce.py -l urls/target.txt -o results/success.txt "$@"

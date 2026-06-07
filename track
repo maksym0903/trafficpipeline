@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Step 8: traffic tracking — logs, GA, GSC, rankings, conversions
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results logs config
+exec python3 scripts/track_traffic.py "$@"

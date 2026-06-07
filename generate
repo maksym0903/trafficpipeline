@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Step 5 only: candidates.txt → output/pages/ + manifest.csv
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p output logs config
+exec python3 scripts/generate_pages.py "$@"

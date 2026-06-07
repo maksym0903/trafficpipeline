@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Quick scan only (Steps 1–4). For full pipeline use: ./run-all
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results logs config
+
+echo "=== Step 1–2: Scan + report ==="
+python3 scripts/build_report.py "$@"
+
+echo ""
+echo "=== Step 3: Classify nodes ==="
+python3 scripts/classify_nodes.py
+
+echo ""
+echo "=== Step 4: Check nodes + candidates ==="
+python3 scripts/check_nodes.py --skip-indexable --auto-traffic medium "$@"
+
+echo ""
+echo "=== Step 5: Generate pages (test) ==="
+python3 scripts/generate_pages.py --test
+
+echo ""
+echo "=== Done (Steps 1–5) ==="
+echo "  report:      results/report.csv"
+echo "  stacks:      results/*.txt"
+echo "  candidates:  results/candidates.txt"
+echo "  pages:       output/pages/"
+echo "  manifest:    output/manifest.csv"
+echo "  preview:     output/preview/index.html"
+echo ""
+echo "  Full pipeline:  ./run-all"
+echo "  Test mode:      ./run-all --test"

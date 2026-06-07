@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Step 6: manifest.csv → push page + sitemap + robots + cache clear on remote nodes
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+mkdir -p results logs output
+exec python3 scripts/publish_pages.py "$@"

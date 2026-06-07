@@ -1,0 +1,2 @@
+# Risk / authorization gate (Layer 1) — set to yes only with written permission.
+authorized=yes
