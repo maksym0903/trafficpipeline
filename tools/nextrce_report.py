@@ -176,6 +176,9 @@ def format_enrich_value(column, output):
         return ''
     if column == 'os':
         return parse_os_release(output) or clean_shell_output(output)
+    if column == 'server_country':
+        code = clean_shell_output(output).strip().upper()
+        return code if len(code) == 2 and code.isalpha() else ''
     return clean_shell_output(output)
 
 

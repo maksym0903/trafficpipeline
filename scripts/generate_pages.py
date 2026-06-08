@@ -23,8 +23,9 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trial_common import (
-    CANDIDATES_TXT, PROJECT_ROOT, REPORT_CSV, load_candidates, load_destination,
-    load_report, render_template_file, build_conversion_url,
+    CANDIDATES_TXT, PROJECT_ROOT, REPORT_CSV, build_baidu_head_snippet,
+    load_analytics, load_candidates, load_destination, load_report,
+    render_template_file, build_conversion_url,
 )
 
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output', 'pages')
@@ -46,7 +47,7 @@ def host_key(url):
     return (urlparse(url).hostname or 'unknown').replace(':', '_')
 
 
-PAGE_RAW_HTML_KEYS = frozenset({'content_block', 'internal_links', 'offer_block'})
+PAGE_RAW_HTML_KEYS = frozenset({'analytics_block', 'content_block', 'internal_links', 'offer_block'})
 
 
 def load_page_specs(path=PAGES_CSV):
@@ -104,6 +105,10 @@ def generate(candidates, page_specs, report_rows, dest, template_path, out_dir, 
     os.makedirs(out_dir, exist_ok=True)
     manifest_rows = []
     preview_items = []
+    analytics = load_analytics()
+    analytics_block = (
+        build_baidu_head_snippet(analytics['hm_id']) if analytics.get('enabled') else ''
+    )
 
     for url in candidates:
         row = report_rows.get(url, {})
@@ -116,6 +121,7 @@ def generate(candidates, page_specs, report_rows, dest, template_path, out_dir, 
             slug = slugify(fields['keyword'])
             canonical = url.rstrip('/') + '/' + slug
             fields['offer_block'] = dest.get('offer_block') or ''
+            fields['analytics_block'] = analytics_block
             fields['cta_text'] = dest.get('cta_text') or 'Claim Bonus'
             fields['conversion_url'] = conversion_url
             html_doc = render_page(template_path, fields, canonical)

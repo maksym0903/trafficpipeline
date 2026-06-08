@@ -7,8 +7,10 @@ Metrics:
   2. deployable_domains_count (candidates)
   3. published_page_count     (published.txt)
   4. indexed_page_count       (indexing ready + partial)
-  5. traffic_click_count      (sum server_log_hits)
-  6. conversion_landing_clicks (sum conversion_clicks → destination)
+  5. page_views                 (sum page_views)
+  6. unique_visitors            (sum unique_visitors)
+  7. conversion_landing_clicks  (sum conversion_clicks → destination)
+  8. unique_converters          (sum unique_converters)
 """
 import argparse
 import csv
@@ -40,8 +42,10 @@ METRICS = [
     ('deployable_domains_count', 'Domains passing candidate rules'),
     ('published_page_count', 'Traffic pages published to nodes'),
     ('indexed_page_count', 'Pages indexed or partially indexed'),
-    ('traffic_click_count', 'Server log hits on traffic pages'),
-    ('conversion_landing_clicks', 'Clicks reaching destination (liumen26)'),
+    ('page_views', 'Total HTML page views across published sites'),
+    ('unique_visitors', 'Unique visitor IPs across published sites'),
+    ('conversion_landing_clicks', 'Claim Bonus landings on destination (liumen26)'),
+    ('unique_converters', 'Unique IPs that reached destination'),
 ]
 
 
@@ -82,16 +86,20 @@ def collect_metrics():
     if indexed == 0 and os.path.isfile(INDEXED_TXT):
         indexed = len(load_published(INDEXED_TXT))
 
-    traffic_clicks = sum_traffic_column(TRAFFIC_REPORT_CSV, 'server_log_hits')
+    traffic_clicks = sum_traffic_column(TRAFFIC_REPORT_CSV, 'page_views')
+    unique_visitors = sum_traffic_column(TRAFFIC_REPORT_CSV, 'unique_visitors')
     conversion_clicks = sum_traffic_column(TRAFFIC_REPORT_CSV, 'conversion_clicks')
+    unique_converters = sum_traffic_column(TRAFFIC_REPORT_CSV, 'unique_converters')
 
     return {
         'usable_nodes_count': usable,
         'deployable_domains_count': deployable,
         'published_page_count': published,
         'indexed_page_count': indexed,
-        'traffic_click_count': traffic_clicks,
+        'page_views': traffic_clicks,
+        'unique_visitors': unique_visitors,
         'conversion_landing_clicks': conversion_clicks,
+        'unique_converters': unique_converters,
     }
 
 

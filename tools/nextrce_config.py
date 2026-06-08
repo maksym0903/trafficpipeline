@@ -4,7 +4,7 @@ MAX_THREADS = 500
 
 REPORT_COLUMNS = [
     'url', 'status', 'access', 'user', 'hostname', 'os', 'nodejs', 'docker',
-    'webroot', 'domain_type', 'traffic_value', 'notes', 'indexable',
+    'webroot', 'domain_type', 'traffic_value', 'notes', 'indexable', 'server_country',
 ]
 
 # Post-scan enrichment: column -> shell command (success targets only)
@@ -19,6 +19,10 @@ ENRICH_COMMANDS = {
         'timeout 12 find /var/www /app /home /opt -maxdepth 8 -name package.json '
         '-not -path "*/node_modules/*" -not -path "*/.cache/*" '
         '-not -path "*/yarn/*" 2>/dev/null | head -5'
+    ),
+    'server_country': (
+        "curl -fsS --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '\\n' "
+        "|| wget -qO- --timeout=8 https://ipinfo.io/country 2>/dev/null | tr -d '\\n'"
     ),
 }
 

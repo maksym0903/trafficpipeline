@@ -1,111 +1,150 @@
 # Trial Pipeline
 
-An automated research pipeline for scanning Next.js targets (CVE-2025-55182), enriching results, generating SEO pages, and publishing them to compromised nodes. **For authorized security research and penetration testing only.**
+Automated pipeline for scanning Next.js targets (CVE-2025-55182), publishing bridge pages, and measuring traffic. **For authorized security research and penetration testing only.**
 
 ## Legal and ethical use
 
-Only run this tooling against systems you own or have explicit written permission to test. Unauthorized access to computer systems is illegal in most jurisdictions. The authors provide this software for defensive research and remediation validation—not for deploying content on third-party sites without consent.
+Only run this against systems you own or have explicit written permission to test. Unauthorized access is illegal in most jurisdictions.
 
 ## Requirements
 
 - Python 3.10+
-- Linux or macOS recommended; Windows works via `python run_all.py` (see below)
-- Remote targets must be reachable and vulnerable (Next.js App Router / CVE-2025-55182)
-
-### Python dependencies
+- Linux or macOS recommended; Windows works via `python run_all.py`
+- `pip install -r requirements.txt` (`openpyxl`, `cryptography` for optional features)
 
 ```bash
-pip install -r requirements.txt
+export TRIAL_SSL_VERIFY=1   # optional: verify HTTPS certs (default: off)
 ```
 
-| Package | Required for |
-|---------|----------------|
-| `openpyxl` | Excel report export (`results/report.xlsx`) |
-| `cryptography` | AES stealth mode in `nextrce` hijack shell (`--stealth`) |
+---
 
-Core scanning and pipeline scripts use the Python standard library only.
+## Workflow
 
-### SSL verification
+End-to-end flow a developer should follow:
 
-HTTPS requests verify certificates when `TRIAL_SSL_VERIFY=1` is set. By default verification is disabled to tolerate misconfigured scan targets. Enable verification in production or when checking indexing on public URLs:
-
-```bash
-export TRIAL_SSL_VERIFY=1
+```
+1–4  Scan & select nodes     urls/target.txt → results/report.csv → results/candidates.txt
+5    Generate bridge pages   config/pages.csv → output/pages/, output/manifest.csv
+6    Publish to nodes         → results/published.txt
+7    Indexing (optional)      → results/indexing.csv
+8    Track traffic            → results/traffic_report.csv   ← main metrics
+9    Aggregate results        → results/client_report.csv    ← totals
 ```
 
-## Quick start
+**Traffic funnel**
+
+```
+Search / direct visit → bridge page on compromised node → user clicks CTA → destination (UTM tracked)
+```
+
+Each published domain gets a unique `utm_campaign` (from hostname) in links to the destination configured in `config/destination.csv`.
+
+### Run commands
 
 ```bash
-# Full pipeline (bash)
+# Full pipeline
 ./run-all
 
-# Cross-platform (Windows / no bash)
+# Cross-platform
 python run_all.py
 
-# Scan only (Steps 1–4)
-./pipeline
+# Traffic only (after pages are published)
+./track
+# or
+python3 scripts/track_traffic.py --published-only
 
-# Individual steps
-python3 scripts/generate_pages.py --test
-python3 scripts/publish_pages.py --dry-run
+# Refresh totals after tracking
+python3 scripts/result_report.py
 ```
 
-### Pipeline steps
+Use `--test` or `-u https://example.com` on individual scripts to try one site first.
 
-| Step | Script | Output |
-|------|--------|--------|
-| 1–2 | `scripts/build_report.py` | `results/report.csv` |
-| 3 | `scripts/classify_nodes.py` | `results/*.txt` stack files |
-| 4 | `scripts/check_nodes.py` | `results/candidates.txt` |
-| 5 | `scripts/generate_pages.py` | `output/pages/`, `output/manifest.csv` |
-| 5a | `scripts/authorize_check.py` | `logs/authorization.log` (Layer 1) |
-| 5b | `scripts/backup_deploy.py` | `output/backup/<timestamp>/` (Layer 2) |
-| 6 | `scripts/publish_pages.py` | `results/published.txt` |
-| 7 | `scripts/index_pages.py` | `results/indexing.csv` |
-| 8 | `scripts/track_traffic.py` | `results/traffic_report.csv` |
-| 9 | `scripts/result_report.py` | `results/client_report.csv` (Layer 3) |
-| 10 | `scripts/optimize_loop.py` | `config/traffic.csv` refresh |
+---
 
-### Traffic funnel (business goal)
+## Results (traffic volume, IPs, clicks)
 
+After Step 8–9, read these files. Everything else in `results/` is scan/deploy metadata.
+
+### Primary output: `results/traffic_report.csv`
+
+One row per published site. Columns that matter:
+
+| Column | What it is |
+|--------|------------|
+| `page_views` | **Traffic volume** — HTML page requests in the node’s access logs (excludes static assets) |
+| `server_log_hits` | **Traffic volume** — requests that hit the bridge page path (`/{slug}`) |
+| `unique_visitors` | **IP count** — distinct client IPs that generated those page views |
+| `conversion_clicks` | **Click count** — destination log lines matching this site’s UTM campaign (CTA landings) |
+| `unique_converters` | **IP count** — distinct IPs that clicked through to the destination |
+
+Example row:
+
+```csv
+"url","page_views","unique_visitors","server_log_hits","conversion_clicks","unique_converters"
+"https://example.com","142","87","56","12","9"
 ```
-Google/Bing search → indexed bridge page → user reads content → clicks CTA → liumen26 (UTM tracked)
+
+### Totals: `results/client_report.csv`
+
+Aggregated across all sites in `traffic_report.csv`:
+
+| Metric | Meaning |
+|--------|---------|
+| `page_views` | Total traffic volume |
+| `unique_visitors` | Total unique visitor IPs (summed per site; same IP on two sites counts twice) |
+| `conversion_landing_clicks` | Total CTA clicks to destination |
+| `unique_converters` | Total unique converter IPs (summed per site) |
+
+Human-readable copy: `results/client_report.html`  
+Per-run log: `logs/traffic.log`
+
+### How metrics are collected
+
+| Source | Metrics |
+|--------|---------|
+| Node access logs (RCE) | `page_views`, `unique_visitors`, `server_log_hits` |
+| Destination access logs (RCE on `tracking_rce_url`) | `conversion_clicks`, `unique_converters` |
+| Optional manual CSV | `gsc_clicks`, `ranking_keyword`, `ranking_position` in `config/tracking_manual.csv` |
+
+**IP list note:** The pipeline counts unique IPs from log fields; it does **not** write a separate raw IP list file. Use `unique_visitors` / `unique_converters` per URL in `traffic_report.csv` for IP cardinality. Destination conversion tracking requires `tracking_rce_url` in `config/destination.csv` (or an RCE-accessible node on the same host as the destination).
+
+### Quick read
+
+```bash
+# Per-site breakdown
+column -t -s, results/traffic_report.csv | less -S
+
+# Totals only
+grep -E 'page_views|unique_visitors|conversion_landing|unique_converters' results/client_report.csv
 ```
 
-Bridge pages include visible **Claim Bonus** CTA links (no auto-redirect). Each domain gets a unique UTM campaign in `config/destination.csv`.
+---
 
-### Client deliverables (Step 9)
+## Configuration (traffic-related)
 
-1. usable nodes count  
-2. deployable domains count  
-3. published page count  
-4. indexed page count  
-5. traffic/click count  
-6. conversion/landing clicks (to destination)
+| File | Purpose |
+|------|---------|
+| `config/destination.csv` | Destination URL, UTM params, CTA text; `tracking_rce_url` for click/IP tracking |
+| `config/tracking_manual.csv` | Optional Search Console clicks and rank data |
+| `output/manifest.csv` | Maps each site to its published page URL and slug (input to Step 8) |
+| `results/published.txt` | Sites that received a page (`--published-only` filter) |
 
-## Configuration
-
-- `urls/target.txt` — scan target list
-- `config/pages.csv` — bridge page content (keyword, title, HTML blocks)
-- `config/destination.csv` — final destination URL + UTM + CTA text
-- `config/authorized.txt` — Layer 1 gate (`authorized=yes` required)
-- `config/traffic.csv` — optional traffic tier overrides
-- `templates/page.html` — HTML shell with `{{placeholders}}`
-
-Generated artifacts (`output/`, `results/`, `logs/`) are git-ignored; regenerate them by running the pipeline.
+---
 
 ## Project layout
 
 ```
-scripts/          Pipeline Python scripts + trial_common.py (shared helpers)
-tools/            nextrce scanner (split into nextrce_*.py modules)
-templates/        HTML and sitemap templates
-config/           CSV configuration
-urls/             Target URL lists
-run-all           Bash orchestrator (Unix)
-run_all.py        Cross-platform orchestrator
+scripts/     Pipeline steps (track_traffic.py, result_report.py, …)
+tools/       nextrce scanner
+config/      CSV configuration
+templates/   Bridge page HTML
+run-all      Full pipeline (bash)
+run_all.py   Full pipeline (cross-platform)
+track        Step 8 shortcut
 ```
 
-## Windows notes
+Generated artifacts (`output/`, `results/`, `logs/`) are git-ignored; run the pipeline to regenerate them.
 
-Root shell scripts (`run-all`, `pipeline`, `scan`, etc.) require Bash (Git Bash or WSL). Use `python run_all.py` or invoke `python scripts/<step>.py` directly on Windows.
+## Windows
+
+Use `python run_all.py` or `python scripts/<step>.py` directly. Shell wrappers (`run-all`, `track`, …) need Git Bash or WSL.

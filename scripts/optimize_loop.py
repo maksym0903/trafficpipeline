@@ -24,7 +24,7 @@ OPT_LOG = os.path.join(LOGS_DIR, 'optimize.log')
 
 def tier_from_row(row):
     try:
-        hits = int(row.get('server_log_hits') or 0)
+        hits = int(row.get('page_views') or row.get('server_log_hits') or 0)
         conv = int(row.get('conversion_clicks') or 0)
         gsc = int(row.get('gsc_clicks') or 0)
     except ValueError:
